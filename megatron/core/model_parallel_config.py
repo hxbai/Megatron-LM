@@ -406,6 +406,10 @@ class ModelParallelConfig:
        custom built torch with torch.distributed.ring_exchange.
     """
 
+    use_symmetric_memory_p2p: bool = False
+    """Use symmetric memory for pipeline parallel communication.
+    """
+
     deallocate_pipeline_outputs: bool = False
     """If True, output data is deallocated after the tensor is sent to the next pipeline stage.
        Helps with saving memory, does nothing when pipeline parallel is not used.

@@ -935,6 +935,57 @@ def get_pp_rank_microbatches(
     )
 
 
+def get_pp_rank0_warmup_microbatches(
+    num_microbatches,
+    num_model_chunks,
+    microbatch_group_size_per_vp_stage,
+    forward_only=False,
+    overlap_moe_expert_parallel_comm=False,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+):
+    """Get the number of total, warmup, and remaining microbatches in PP scheduling."""
+    if p2p_communicator is not None:
+        pipeline_parallel_size = p2p_communicator.pp_group.size()
+        pipeline_parallel_rank = 0
+        virtual_pipeline_parallel_size = p2p_communicator.virtual_pipeline_model_parallel_size
+    else:
+        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        pipeline_parallel_rank = 0
+        virtual_pipeline_parallel_size = (
+            parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        )
+
+    total_num_microbatches = num_microbatches * num_model_chunks
+    are_all_microbatches_in_warmup = False
+
+    if forward_only:
+        num_warmup_microbatches = total_num_microbatches
+    elif pipeline_parallel_size > 1:
+        if virtual_pipeline_parallel_size is None:
+            # forward_backward_pipelining_without_interleaving
+            num_warmup_microbatches = pipeline_parallel_size - pipeline_parallel_rank - 1
+        else:
+            # forward_backward_pipelining_with_interleaving
+            # Run (num_model_chunks-1)*microbatch_group_size_per_vp_stage on
+            # all workers, followed by more microbatches after depending on
+            # stage ID (more forward passes for earlier stages, later stages can
+            # immediately start with 1F1B).
+            num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
+            num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
+            # When enabling overlap_moe_expert_parallel_comm, we schedule one extra micro-batch
+            # forward step before the 1f1b stages. This is needed to ensure the forward
+            # and backward computations are independent in all 1f1b steps.
+            if overlap_moe_expert_parallel_comm:
+                num_warmup_microbatches = num_warmup_microbatches + 1
+            # number of 1F1B microbatches before backward for first model chunk
+            num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
+    else:
+        # forward_backward_no_pipelining
+        # This path is only used for cuda graph capturing compatibility for the PP=1 case.
+        num_warmup_microbatches = 0
+    return num_warmup_microbatches
+
+
 def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage):
     """Get the schedule table for PP scheduling."""
     schedule_table = []
@@ -1304,6 +1355,12 @@ def forward_backward_pipelining_with_interleaving(
         overlap_moe_expert_parallel_comm=config.overlap_moe_expert_parallel_comm,
         p2p_communicator=p2p_communicator,
     )
+    num_warmup_microbatches_pp0 = get_pp_rank0_warmup_microbatches(
+        num_microbatches,
+        num_model_chunks,
+        config.microbatch_group_size_per_vp_stage,
+        p2p_communicator=p2p_communicator,
+    )
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
@@ -1332,7 +1389,6 @@ def forward_backward_pipelining_with_interleaving(
     schedule_table = get_schedule_table(
         num_microbatches, len(model), config.microbatch_group_size_per_vp_stage
     )
-
     # Decouple individual lookup table for microbatch_id and model_chunk_id.
     # For example, the micro-batch table for PP2 N3M5 with VP2 is
     # virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
@@ -1643,6 +1699,9 @@ def forward_backward_pipelining_with_interleaving(
 
     # Run warmup forward passes.
     nvtx_range_push(suffix="warmup")
+    p2p_communicator.create_symm_put_wait_buffers(
+        tensor_shape, num_warmup_microbatches_pp0, num_microbatches
+    )
     input_tensors[0].append(
         p2p_communicator.recv_forward(
             tensor_shape, _is_vp_first_stage(vp_stage=0) and is_pp_first_stage(pp_group)
@@ -2179,6 +2238,8 @@ def forward_backward_pipelining_with_interleaving(
         not recv_next_wait_handles
     ), 'recv_next_wait_handles should be cleared at the end of a step'
 
+    if getattr(config, "moe_paged_stash", False):
+        paged_stash_reset(enabled=not forward_only, config=config)
     if config.finalize_model_grads_func is not None and not forward_only:
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
@@ -2209,6 +2270,9 @@ def forward_backward_pipelining_with_interleaving(
 
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
+
+    if config.use_symmetric_memory_p2p:
+        p2p_communicator.symm_join()
     nvtx_range_pop(suffix="misc")
 
     return forward_data_store
@@ -2470,7 +2534,16 @@ def forward_backward_pipelining_without_interleaving(
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
             recv_tensor_shapes, send_tensor_shapes
         )
-
+    if config.use_symmetric_memory_p2p:
+        num_warmup_microbatches_pp0 = get_pp_rank0_warmup_microbatches(
+            num_microbatches,
+            1,
+            config.microbatch_group_size_per_vp_stage,
+            p2p_communicator=p2p_communicator,
+        )
+        p2p_communicator.create_symm_put_wait_buffers(
+            send_tensor_shapes[0], num_warmup_microbatches_pp0, num_microbatches
+        )
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
@@ -2656,5 +2729,8 @@ def forward_backward_pipelining_without_interleaving(
 
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
+
+    if config.use_symmetric_memory_p2p:
+        p2p_communicator.symm_join()
 
     return forward_data_store

@@ -226,6 +226,7 @@ def create_group(
         "pg_options": pg_options,
         "use_local_synchronization": use_local_synchronization,
         "group_desc": group_desc,
+        "device_id": torch.device(f"cuda:{torch.cuda.current_device()}"),
     }
     if not is_torch_min_version("2.4.0"):
         kwargs.pop("group_desc")
@@ -447,9 +448,7 @@ class RankGenerator(object):
     def __init__(
         self, tp: int, ep: int, dp: int, pp: int, cp: int, order: str, rank_offset: int = 0
     ) -> None:
-        assert (
-            ep == 1 or cp == 1
-        ), "Both EP and CP > 1 in not allow in one rank generator. \
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 in not allow in one rank generator. \
             CP is only included in default RankGenerator, and EP only in expert RankGenerator."
 
         self.tp = tp
