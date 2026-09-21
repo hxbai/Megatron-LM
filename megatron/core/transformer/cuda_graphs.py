@@ -48,6 +48,7 @@ from megatron.core.utils import (
     is_te_min_version,
     log_on_each_pipeline_stage,
     log_single_rank,
+    mark_tensor_storage_reusable,
 )
 
 try:
@@ -833,6 +834,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
             torch.cuda.current_stream().wait_event(runner.fwd_completion_event)
         else:
             runner.fwd_graph.replay()
+        if getattr(getattr(runner.base_module, 'config', None), 'use_symmetric_memory_p2p', False):
+            mark_tensor_storage_reusable(runner.fwd_graph_output_surface)
         return runner.fwd_graph_output_surface
 
     @staticmethod
@@ -890,6 +893,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
                         if hook is not None:
                             hook()
 
+        if getattr(getattr(runner.base_module, 'config', None), 'use_symmetric_memory_p2p', False):
+            mark_tensor_storage_reusable(runner.static_grad_inputs)
         return None, None, *runner.static_grad_inputs, *(None,) * len(runner.params_to_backprop)
 
 

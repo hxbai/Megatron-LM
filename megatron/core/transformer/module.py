@@ -18,6 +18,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import mark_cuda_graph_outputs
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
@@ -732,7 +733,12 @@ class GraphableMegatronModule(MegatronModule):
 
             for hook, hook_args in self.cuda_graph_manual_hooks:
                 hook(*hook_args)
-            return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+            outputs = self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+            if self.config.use_symmetric_memory_p2p:
+                # Describe the actual storage, not the model's graph/recompute scope.
+                # Eager operations after this replay may produce independent outputs.
+                mark_cuda_graph_outputs(outputs)
+            return outputs
         finally:
             self._te_cuda_graph_route_replay_state = None
 

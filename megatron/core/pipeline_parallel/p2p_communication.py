@@ -8,7 +8,11 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.pipeline_parallel.symmetric_p2p import SymmMemBuffer, _symm_mem_p2p_ops
+from megatron.core.pipeline_parallel.symmetric_p2p import (
+    RecvSlotPlan,
+    SymmMemBuffer,
+    _symm_mem_p2p_ops,
+)
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.utils import nvtx_decorator
 
@@ -155,6 +159,7 @@ class P2PCommunicator:
         # Basic attrs
         self.pp_group = pp_group
         self.config = config
+        self._use_symmetric_memory_p2p = config.use_symmetric_memory_p2p
 
         world_size = self.pp_group.size()
         curr_rank_in_pg = self.pp_group.rank()
@@ -172,11 +177,25 @@ class P2PCommunicator:
         )
         self.symm_mem_pool = None
         if config.use_symmetric_memory_p2p:
-            assert (
-                not config.variable_seq_lengths
-            ), "symmetric memory p2p is not supported with variable sequence lengths"
+            assert not config.variable_seq_lengths or config.pipeline_p2p_fixed_shape, (
+                "symmetric memory p2p with variable sequence lengths requires "
+                "pipeline_p2p_fixed_shape and padding to max_seqlen_per_dp_cp_rank"
+            )
+            assert not config.mtp_standalone, "0-SM P2P does not support standalone MTP"
+            # NCCL symmetric-memory rendezvous needs an initialized communicator. Only
+            # initialize this PP group when 0-SM is enabled: eager initialization of
+            # ordinary PP groups serializes their otherwise independent unbatched P2P ops.
+            device = torch.device("cuda", torch.cuda.current_device())
+            backend = self.pp_group._get_backend(device)
+            # Schedules can construct a new P2PCommunicator each iteration. Eager
+            # connect is not idempotent: it replaces the symmetric-memory communicator
+            # while cached buffers still hold windows registered on the old one.
+            # _comm_ptr() queries the collective communicator on the current device,
+            # also covering groups initialized before this P2PCommunicator was created.
+            if backend._comm_ptr() == 0:
+                backend.eager_connect_single_device(device)
             symm_mem.set_backend("NCCL")
-            self.symm_mem_pool = symm_mem.get_mem_pool(torch.cuda.current_device())
+            self.symm_mem_pool = symm_mem.get_mem_pool(device)
 
     @property
     def is_pp_first_stage(self) -> bool:
@@ -368,7 +387,7 @@ class P2PCommunicator:
                     "tensor_shape must be specified if recv_prev is True. "
                     "Common tensor_shape is (seq_length, micro_batch_size, hidden_size)"
                 )
-            if config.use_symmetric_memory_p2p:
+            if self._use_symmetric_memory_p2p:
                 tensor_recv_prev_func = P2PCommunicator.symm_buffers[
                     'send_next_recv_prev'
                 ].get_recv_buffer
@@ -383,7 +402,7 @@ class P2PCommunicator:
                     "tensor_shape must be specified if recv_next is True. "
                     "Common tensor_shape is (seq_length, micro_batch_size, hidden_size)"
                 )
-            if config.use_symmetric_memory_p2p:
+            if self._use_symmetric_memory_p2p:
                 tensor_recv_next_func = P2PCommunicator.symm_buffers[
                     'send_prev_recv_next'
                 ].get_recv_buffer
@@ -391,7 +410,7 @@ class P2PCommunicator:
                 tensor_recv_next_func = create_tensor_recv_next
 
         # Send tensors in both the forward and backward directions as appropriate.
-        if config.use_symmetric_memory_p2p:
+        if self._use_symmetric_memory_p2p:
             p2p_func = _symm_mem_p2p_ops
             config.batch_p2p_comm = False
         elif config.use_ring_exchange_p2p:
@@ -408,8 +427,8 @@ class P2PCommunicator:
             p2p_func = _p2p_ops
 
         pp_group = self.pp_group
-        next_rank = self.next_rank if not config.use_symmetric_memory_p2p else self.next_rank_pg
-        prev_rank = self.prev_rank if not config.use_symmetric_memory_p2p else self.prev_rank_pg
+        next_rank = self.next_rank_pg if self._use_symmetric_memory_p2p else self.next_rank
+        prev_rank = self.prev_rank_pg if self._use_symmetric_memory_p2p else self.prev_rank
 
         if config.use_ring_exchange_p2p or config.batch_p2p_comm:
             reqs = []
@@ -473,32 +492,126 @@ class P2PCommunicator:
         return tensor_recv_prev, tensor_recv_next, reqs
 
     def create_symm_put_wait_buffers(
-        self, tensor_shape, num_warmup_microbatches_pp0, num_microbatches
+        self,
+        tensor_shape,
+        num_warmup_microbatches_pp0,
+        num_microbatches,
+        *,
+        recv_slot_plan: RecvSlotPlan | None = None,
+        forward_only: bool = False,
     ):
-        if not self.config.use_symmetric_memory_p2p:
+        # Forward-only evaluation has no backward acknowledgement of slot lifetimes.
+        # Use ordinary P2P without resizing/re-registering the training windows, so
+        # train -> eval -> train preserves both their addresses and memory savings.
+        self._use_symmetric_memory_p2p = self.config.use_symmetric_memory_p2p and not forward_only
+        if not self._use_symmetric_memory_p2p:
             return
         assert tensor_shape is not None, "tensor_shape must be provided"
+
+        num_forward_buffers = num_warmup_microbatches_pp0 + 1
+        num_backward_buffers = num_forward_buffers
+        pp_size = self.pp_group.size()
+        if (
+            self.virtual_pipeline_model_parallel_size is not None
+            and self.config.microbatch_group_size_per_vp_stage == pp_size
+            and num_microbatches % pp_size == 0
+            and not self.config.overlap_moe_expert_parallel_comm
+        ):
+            # Ordinary depth-first interleaved 1F1B: a backward receive only
+            # lives through its own backward, not through the forward warmup.
+            # 2*PP-1 slots cover the worst producer lead (including cooldown)
+            # without extra credit messages or synchronizing pipeline ranks.
+            # Keep the original bound for other schedules/group sizes.
+            num_backward_buffers = min(num_forward_buffers, 2 * pp_size - 1)
+
+        shared_pool = recv_slot_plan is not None and recv_slot_plan.backward_send_slots is not None
+        if recv_slot_plan is not None:
+            if len(recv_slot_plan.send_slots) != pp_size or (
+                shared_pool and len(recv_slot_plan.backward_send_slots) != pp_size
+            ):
+                raise ValueError('Symmetric P2P slot plan does not match the PP group size')
+            num_forward_buffers = recv_slot_plan.num_buffers
+            if shared_pool:
+                num_backward_buffers = num_forward_buffers
 
         if len(P2PCommunicator.symm_buffers) == 0:
             P2PCommunicator.symm_buffers['send_next_recv_prev'] = SymmMemBuffer(
                 tensor_shape,
                 self.config.pipeline_dtype,
                 self.pp_group,
-                num_warmup_microbatches_pp0 + 1,
+                num_forward_buffers,
                 self.symm_mem_pool,
             )
             P2PCommunicator.symm_buffers['send_prev_recv_next'] = SymmMemBuffer(
                 tensor_shape,
                 self.config.pipeline_dtype,
                 self.pp_group,
-                num_warmup_microbatches_pp0 + 1,
+                num_backward_buffers,
                 self.symm_mem_pool,
+                requires_grad=False,
+                shared_recv_buffers=(
+                    P2PCommunicator.symm_buffers['send_next_recv_prev'].recv_buffers
+                    if shared_pool
+                    else None
+                ),
             )
 
+        expected_sizes = {
+            'send_next_recv_prev': num_forward_buffers,
+            'send_prev_recv_next': num_backward_buffers,
+        }
         for key in P2PCommunicator.symm_buffers:
-            P2PCommunicator.symm_buffers[key].reset()
+            buffers = P2PCommunicator.symm_buffers[key]
+            if (
+                tuple(buffers.shape) != tuple(tensor_shape)
+                or buffers.dtype != self.config.pipeline_dtype
+                or buffers.pp_group is not self.pp_group
+                or buffers.num_recv_buffers < expected_sizes[key]
+                or (key == 'send_prev_recv_next' and buffers.shared_recv_buffers != shared_pool)
+            ):
+                raise RuntimeError(
+                    'Cached symmetric P2P buffers do not match the pipeline shape, group, '
+                    'or schedule. Reinitialize the training process before changing them.'
+                )
+        for key, buffers in P2PCommunicator.symm_buffers.items():
+            if recv_slot_plan is not None and (key == 'send_next_recv_prev' or shared_pool):
+                rank = self.pp_group.rank()
+                is_forward = key == 'send_next_recv_prev'
+                slots = (
+                    recv_slot_plan.send_slots if is_forward else recv_slot_plan.backward_send_slots
+                )
+                buffers.reset(
+                    send_slots=slots[rank],
+                    recv_slots=slots[(rank + (-1 if is_forward else 1)) % pp_size],
+                )
+            else:
+                buffers.reset()
+
+    def prepare_input_tensor_grad(self, input_tensor: torch.Tensor | dict | list | None) -> None:
+        """Prepare fresh input gradients after prior graph outputs have been staged."""
+        if not self._use_symmetric_memory_p2p:
+            return
+
+        def iter_tensors(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    yield from iter_tensors(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    yield from iter_tensors(item)
+            elif value is not None:
+                yield value
+
+        forward_buffers = self.symm_buffers['send_next_recv_prev']
+        backward_buffers = self.symm_buffers['send_prev_recv_next']
+        for buffer in backward_buffers.send_buffers:
+            buffer.wait()
+        for tensor in iter_tensors(input_tensor):
+            forward_buffers.prepare_grad(tensor)
 
     def symm_join(self):
+        if not self._use_symmetric_memory_p2p:
+            return
         for key in P2PCommunicator.symm_buffers:
             P2PCommunicator.symm_buffers[key].join()
 
