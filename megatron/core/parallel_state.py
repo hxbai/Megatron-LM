@@ -226,7 +226,6 @@ def create_group(
         "pg_options": pg_options,
         "use_local_synchronization": use_local_synchronization,
         "group_desc": group_desc,
-        "device_id": torch.device(f"cuda:{torch.cuda.current_device()}"),
     }
     if not is_torch_min_version("2.4.0"):
         kwargs.pop("group_desc")

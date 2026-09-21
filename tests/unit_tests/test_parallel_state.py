@@ -14,6 +14,21 @@ world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
+@pytest.mark.parametrize('backend', ['nccl', 'gloo'])
+def test_create_group_preserves_lazy_initialization(mocker, backend):
+    new_group = mocker.patch.object(torch.distributed, 'new_group')
+    mocker.patch.object(torch.distributed, 'get_rank', return_value=0)
+    current_device = mocker.patch.object(torch.cuda, 'current_device', return_value=3)
+    mocker.patch.object(ps, '_global_process_group_list', [])
+
+    group = ps.create_group(ranks=[0, 1], backend=backend, group_desc='test')
+
+    assert group is new_group.return_value
+    new_group.assert_called_once()
+    assert 'device_id' not in new_group.call_args.kwargs
+    current_device.assert_not_called()
+
+
 @pytest.mark.parametrize('order', test_parallel_order)
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev

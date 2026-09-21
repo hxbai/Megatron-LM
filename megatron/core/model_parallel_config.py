@@ -407,7 +407,8 @@ class ModelParallelConfig:
     """
 
     use_symmetric_memory_p2p: bool = False
-    """Use symmetric memory for pipeline parallel communication.
+    """Use NCCL symmetric memory for pipeline parallel communication with fixed tensor shapes.
+    Packed sequences require pipeline_p2p_fixed_shape and padding to max_seqlen_per_dp_cp_rank.
     """
 
     deallocate_pipeline_outputs: bool = False

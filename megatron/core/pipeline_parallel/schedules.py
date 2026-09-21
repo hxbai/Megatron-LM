@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
-from functools import partial
+from collections import deque
+from functools import lru_cache, partial
 from itertools import zip_longest
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
@@ -14,6 +15,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.symmetric_p2p import RecvSlotPlan
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -531,6 +533,21 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
+def _take_input_tensor_grads(tensors: list[torch.Tensor | None]) -> list[torch.Tensor | None]:
+    """Transfer symmetric PP gradients without retaining them in the receive pool."""
+    # Collect before clearing: multiple input entries may refer to the same leaf.
+    grads = [None if tensor is None else tensor.grad for tensor in tensors]
+    for index, tensor in enumerate(tensors):
+        if tensor is not None and getattr(tensor, '_symmetric_p2p_input', False):
+            tensor.grad = None
+            # An unused input must still send zeros so the matching PP receive
+            # can complete. Normal backward already produced a gradient and
+            # needs neither a cleared buffer nor an extra accumulation into it.
+            if grads[index] is None:
+                grads[index] = torch.zeros_like(tensor, requires_grad=False)
+    return grads
+
+
 def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     """Backward step through passed-in output tensor.
 
@@ -576,14 +593,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
             torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
-    input_tensor_grad = [None]
-    if input_tensor is not None:
-        input_tensor_grad = []
-        for x in input_tensor:
-            if x is None:
-                input_tensor_grad.append(None)
-            else:
-                input_tensor_grad.append(x.grad)
+    input_tensor_grad = _take_input_tensor_grads(input_tensor)
 
     if unwrap_input_tensor_grad:
         input_tensor_grad = input_tensor_grad[0]
@@ -651,16 +661,8 @@ def backward_step_multimodule(
                 )
 
     # Collect gradients for input tensors.
-    input_tensor_grad = {}
-    for module_name, tensor in input_tensor.items():
-        if isinstance(tensor, list):
-            tensor = tensor[0]
-        if tensor is None:
-            input_tensor_grad[module_name] = None
-        else:
-            input_tensor_grad[module_name] = tensor.grad
-
-    return input_tensor_grad
+    tensors = [_unwrap_single_tensor_list(tensor) for tensor in input_tensor.values()]
+    return dict(zip(input_tensor, _take_input_tensor_grads(tensors)))
 
 
 def check_first_val_step(first_val_step, forward_only, cond):
@@ -1016,6 +1018,216 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
     return schedule_table
 
 
+@lru_cache(maxsize=16)
+def _get_symmetric_forward_slot_plan(
+    pipeline_parallel_size: int,
+    num_model_chunks: int,
+    num_microbatches: int,
+    microbatch_group_size_per_vp_stage: int,
+    *,
+    forward_only: bool = False,
+    overlap_moe_expert_parallel_comm: bool = False,
+    delay_wgrad_compute: bool = False,
+) -> RecvSlotPlan | None:
+    """Reuse remote forward inputs after their producer's corresponding backward.
+
+    A producer's backward depends on the receiver's backward (including the
+    last-to-first-rank VPP edge). Its next send therefore cannot overwrite an
+    input still being read downstream, even if the ranks run at different
+    speeds. This uses existing gradient communication as the acknowledgement:
+    no credit messages, extra copies, or device synchronizations are needed.
+
+    The allocation depends only on topology, not the current packed microbatch
+    count. Each step gets its own send/receive lookup tables while registered
+    addresses stay fixed. Flushing all producer backwards also retires every
+    remote input from the previous step, including when the next count changes.
+    Other training schedules keep the existing conservative ring. Forward-only
+    evaluation uses ordinary P2P because there is no backward acknowledgement.
+    """
+    if (
+        pipeline_parallel_size < 2
+        or num_model_chunks < 2
+        or num_microbatches < pipeline_parallel_size
+        or microbatch_group_size_per_vp_stage != pipeline_parallel_size
+        or num_microbatches % pipeline_parallel_size != 0
+        or forward_only
+        or overlap_moe_expert_parallel_comm
+        or delay_wgrad_compute
+    ):
+        return None
+
+    table = get_schedule_table(
+        num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage
+    )
+    # One extra forward precedes each steady-state backward. Unlike a FIFO
+    # ring, slots are released in backward's chunk order, not forward order.
+    num_buffers = (
+        2 * (pipeline_parallel_size - 1)
+        + (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
+        + 1
+    )
+    send_slots = []
+    for rank in range(pipeline_parallel_size):
+        warmup = min(
+            len(table),
+            2 * (pipeline_parallel_size - rank - 1)
+            + (num_model_chunks - 1) * microbatch_group_size_per_vp_stage,
+        )
+        free_slots = deque(range(num_buffers))
+        live_slots = {}
+        rank_slots = []
+
+        def release_backward(entry):
+            microbatch, forward_chunk = entry
+            chunk = num_model_chunks - 1 - forward_chunk
+            if rank != pipeline_parallel_size - 1 or chunk != num_model_chunks - 1:
+                free_slots.append(live_slots.pop((microbatch, chunk)))
+
+        for index, (microbatch, chunk) in enumerate(table):
+            if rank != pipeline_parallel_size - 1 or chunk != num_model_chunks - 1:
+                slot = free_slots.popleft()
+                live_slots[microbatch, chunk] = slot
+                rank_slots.append(slot)
+            if index >= warmup:
+                release_backward(table[index - warmup])
+        for entry in table[len(table) - warmup :]:
+            release_backward(entry)
+        assert not live_slots, 'Symmetric P2P forward slot lifetimes did not drain'
+        send_slots.append(tuple(rank_slots))
+    return RecvSlotPlan(num_buffers, tuple(send_slots))
+
+
+@lru_cache(maxsize=16)
+def _get_symmetric_recv_slot_plan(
+    pipeline_parallel_size: int,
+    num_model_chunks: int,
+    num_microbatches: int,
+    microbatch_group_size_per_vp_stage: int,
+    *,
+    forward_only: bool = False,
+    overlap_moe_expert_parallel_comm: bool = False,
+    delay_wgrad_compute: bool = False,
+) -> RecvSlotPlan | None:
+    """Share forward/backward windows only across causally disjoint lifetimes.
+
+    A forward receive remains live through its backward; a backward receive
+    lives through that same backward. Reuse is allowed only when existing
+    compute/communication dependencies make the new producer wait for the old
+    reader. Local enqueue order alone is insufficient for one-sided writes.
+    Vector clocks encode that dependency for every possible rank skew; no new
+    runtime synchronization, copies, or communication streams are introduced.
+
+    Keep a topology-sized allocation even when the packed microbatch count
+    changes. PP4/VPP4 uses 22 windows instead of separate pools of 19 and 7.
+    PP2 retains separate pools: both directions have the same peer, and the
+    current NCCL API uses a peer signal counter, not a per-window counter.
+    """
+    forward_plan = _get_symmetric_forward_slot_plan(
+        pipeline_parallel_size,
+        num_model_chunks,
+        num_microbatches,
+        microbatch_group_size_per_vp_stage,
+        forward_only=forward_only,
+        overlap_moe_expert_parallel_comm=overlap_moe_expert_parallel_comm,
+        delay_wgrad_compute=delay_wgrad_compute,
+    )
+    if forward_plan is None or pipeline_parallel_size < 3:
+        return forward_plan
+
+    pp, vp = pipeline_parallel_size, num_model_chunks
+    table = get_schedule_table(num_microbatches, vp, microbatch_group_size_per_vp_stage)
+    orders = []
+    for rank in range(pp):
+        warmup = min(len(table), 2 * (pp - rank - 1) + (vp - 1) * pp)
+        order = [(rank, 'F', *entry) for entry in table[:warmup]]
+        for index in range(warmup, len(table)):
+            microbatch, chunk = table[index - warmup]
+            order.extend([(rank, 'F', *table[index]), (rank, 'B', microbatch, vp - 1 - chunk)])
+        order.extend(
+            (rank, 'B', microbatch, vp - 1 - chunk) for microbatch, chunk in table[-warmup:]
+        )
+        orders.append(order)
+
+    # An operation is (PP rank, direction, microbatch, model chunk). A clock
+    # records the last completed compute on each rank required by this operation.
+    positions = {op: index for order in orders for index, op in enumerate(order)}
+    predecessors, followers = {}, {op: [] for op in positions}
+    for order in orders:
+        for index, op in enumerate(order):
+            rank, direction, microbatch, chunk = op
+            dependencies = [order[index - 1]] if index else []
+            if direction == 'F' and (rank != 0 or chunk != 0):
+                dependencies.append(((rank - 1) % pp, 'F', microbatch, chunk - int(rank == 0)))
+            elif direction == 'B' and (rank != pp - 1 or chunk != vp - 1):
+                dependencies.append(((rank + 1) % pp, 'B', microbatch, chunk + int(rank == pp - 1)))
+            predecessors[op] = dependencies
+            for dependency in dependencies:
+                followers[dependency].append(op)
+    remaining = {op: len(dependencies) for op, dependencies in predecessors.items()}
+    ready = deque(op for op in positions if remaining[op] == 0)
+    clocks = {}
+    while ready:
+        op = ready.popleft()
+        clock = [-1] * pp
+        for dependency in predecessors[op]:
+            clock = [max(a, b) for a, b in zip(clock, clocks[dependency])]
+        clock[op[0]] = positions[op]
+        clocks[op] = clock
+        for follower in followers[op]:
+            remaining[follower] -= 1
+            if remaining[follower] == 0:
+                ready.append(follower)
+    if len(clocks) != len(positions):
+        raise RuntimeError('Symmetric P2P slot planner encountered cyclic schedule dependencies')
+
+    messages = [[] for _ in range(pp)]
+    for order in orders:
+        for writer in order:
+            rank, direction, microbatch, chunk = writer
+            if direction == 'F':
+                if rank == pp - 1 and chunk == vp - 1:
+                    continue
+                reader = ((rank + 1) % pp, 'B', microbatch, chunk + int(rank == pp - 1))
+            else:
+                if rank == 0 and chunk == 0:
+                    continue
+                reader = ((rank - 1) % pp, 'B', microbatch, chunk - int(rank == 0))
+            messages[reader[0]].append((writer, reader))
+
+    # Target up to four fewer windows (two for PP3), using a fixed budget rather
+    # than the number used by this particular step. The dependency checks above,
+    # not this budget, determine whether a window can safely be reused.
+    # Fail closed to separate pools if a schedule cannot fit that budget.
+    # Cached windows also reject switching pool modes after registration.
+    num_buffers = forward_plan.num_buffers + 2 * pp - 1 - min(4, 2 * (pp - 2))
+    slots = {}
+    for receiver, incoming in enumerate(messages):
+        last_readers = []
+        for writer, reader in sorted(incoming, key=lambda pair: positions[pair[1]]):
+            reusable = [
+                slot for slot, last in enumerate(last_readers) if last <= clocks[writer][receiver]
+            ]
+            if reusable:
+                # Reuse the most recently retired eligible slot, preserving
+                # earlier slots for producers with fewer dependencies.
+                slot = max(reusable, key=lambda slot: last_readers[slot])
+                last_readers[slot] = positions[reader]
+            else:
+                slot = len(last_readers)
+                if slot == num_buffers:
+                    return forward_plan
+                last_readers.append(positions[reader])
+            slots[writer] = slot
+
+    forward_slots = tuple(
+        tuple(slots[op] for op in order if op[1] == 'F' and op in slots) for order in orders
+    )
+    backward_slots = tuple(
+        tuple(slots[op] for op in order if op[1] == 'B' and op in slots) for order in orders
+    )
+    return RecvSlotPlan(num_buffers, forward_slots, backward_slots)
+
+
 def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
     """Convert a tunable schedule lookup table to the te.make_graphed_callables() accepted
     order format. For example, the tunable schedule table for PP2 N3M5 with VP2 is as below:
@@ -1146,6 +1358,24 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
     return new_order, chunk_id_list
 
 
+def _can_overlap_symmetric_p2p_copy(config, *, forward_only: bool = False) -> bool:
+    """Whether the schedule has an independent compute step before source release.
+
+    Conventional 1F1B already keeps its latest output alive until the next
+    forward's pre-hook. Waiting there lets the intervening backward overlap
+    the copy, without retaining another output or allocating another buffer.
+    Storage reuse is checked on each send's work, not inferred from the model's
+    graph or recompute configuration. The combined EP schedule and forward-only
+    execution do not use this conventional 1F1B lifetime contract.
+    """
+    return (
+        config.use_symmetric_memory_p2p
+        and config.overlap_p2p_comm
+        and not config.overlap_moe_expert_parallel_comm
+        and not forward_only
+    )
+
+
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -1178,6 +1408,7 @@ def forward_backward_pipelining_with_interleaving(
     # virtual_microbatch_id in [0, total_num_microbatches)
 
     config = get_model_config(model[0])
+    overlap_symmetric_p2p_copy = _can_overlap_symmetric_p2p_copy(config, forward_only=forward_only)
     if p2p_communicator is None and pg_collection is None:
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
@@ -1334,10 +1565,11 @@ def forward_backward_pipelining_with_interleaving(
         # Note: This is a simplified approach - proper VPP support may need more complex logic
         hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
 
-    tensor_shape = [seq_length, micro_batch_size, hidden_dim]
-    tensor_shape[0] = tensor_shape[0] // cp_group.size()
-    if config.sequence_parallel:
-        tensor_shape[0] = tensor_shape[0] // tp_group.size()
+    tensor_shape = [
+        _get_p2p_seq_length(seq_length, config, tp_group, cp_group),
+        micro_batch_size,
+        hidden_dim,
+    ]
 
     # Compute number of warmup and remaining microbatches.
     # seems only used for vpp
@@ -1591,6 +1823,8 @@ def forward_backward_pipelining_with_interleaving(
         output_tensor = output_tensors[model_chunk_id].pop(0)
         output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
 
+        if config.use_symmetric_memory_p2p:
+            p2p_communicator.prepare_input_tensor_grad(input_tensor)
         return input_tensor, output_tensor, output_tensor_grad
 
     def backward_step_helper_postprocess(virtual_microbatch_id):
@@ -1699,8 +1933,23 @@ def forward_backward_pipelining_with_interleaving(
 
     # Run warmup forward passes.
     nvtx_range_push(suffix="warmup")
+    recv_slot_plan = None
+    if config.use_symmetric_memory_p2p:
+        recv_slot_plan = _get_symmetric_recv_slot_plan(
+            pipeline_parallel_size,
+            num_model_chunks,
+            num_microbatches,
+            config.microbatch_group_size_per_vp_stage,
+            forward_only=forward_only,
+            overlap_moe_expert_parallel_comm=config.overlap_moe_expert_parallel_comm,
+            delay_wgrad_compute=config.delay_wgrad_compute,
+        )
     p2p_communicator.create_symm_put_wait_buffers(
-        tensor_shape, num_warmup_microbatches_pp0, num_microbatches
+        tensor_shape,
+        num_warmup_microbatches_pp0,
+        num_microbatches,
+        recv_slot_plan=recv_slot_plan,
+        forward_only=forward_only,
     )
     input_tensors[0].append(
         p2p_communicator.recv_forward(
@@ -1842,9 +2091,12 @@ def forward_backward_pipelining_with_interleaving(
                 )
                 if "recv_prev" in fwd_wait_handles:
                     recv_prev_wait_handles.append(fwd_wait_handles.pop("recv_prev"))
-            # isend() copies asynchronously; wait until the copy is done before
-            # freeing the source buffer, otherwise the next PP stage gets corrupted data.
-            if send_next_wait_handle is not None and config.deallocate_pipeline_outputs:
+            # Warmup has no independent backward to cover the copy. Stage the
+            # source before freeing it or replaying a forward graph that may
+            # overwrite its storage, even if pseudo-deallocation is disabled.
+            if send_next_wait_handle is not None and (
+                config.deallocate_pipeline_outputs or config.use_symmetric_memory_p2p
+            ):
                 send_next_wait_handle.wait()
                 send_next_wait_handle = None
 
@@ -1911,6 +2163,7 @@ def forward_backward_pipelining_with_interleaving(
 
             # Sync forward recv
             def pp_pre_forward(vp_stage=None):
+                nonlocal send_next_wait_handle
                 if vp_stage is None:
                     vp_stage = get_model_chunk_id(forward_k, forward=True)
                 if not (_is_vp_first_stage(vp_stage=vp_stage) and is_pp_first_stage(pp_group)):
@@ -1926,6 +2179,12 @@ def forward_backward_pipelining_with_interleaving(
                             recv_prev_wait_handle = recv_prev_wait_handles.pop(0)
                             recv_prev_wait_handle.wait()
 
+                if overlap_symmetric_p2p_copy and send_next_wait_handle is not None:
+                    # Retire the previous forward copy only after the intervening
+                    # backward, but before freeing/reusing its source. The
+                    # existing output_tensor reference bounds this to one output.
+                    send_next_wait_handle.wait()
+                    send_next_wait_handle = None
                 deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
             # Async forward send / receive
@@ -1969,9 +2228,17 @@ def forward_backward_pipelining_with_interleaving(
                     )
                     if "recv_prev" in fwd_wait_handles:
                         recv_prev_wait_handles.append(fwd_wait_handles.pop("recv_prev"))
-                # isend() copies asynchronously; wait until the copy is done before
-                # freeing the source buffer, otherwise the next PP stage gets corrupted data.
-                if send_next_wait_handle is not None and config.deallocate_pipeline_outputs:
+                # Ordinary sources stay alive through backward until pp_pre_forward.
+                # Graph-backed sources must be staged before backward can reuse
+                # their static storage, even with pseudo-deallocation disabled.
+                if (
+                    send_next_wait_handle is not None
+                    and (
+                        not overlap_symmetric_p2p_copy
+                        or not getattr(send_next_wait_handle, 'can_defer_source_wait', False)
+                    )
+                    and (config.deallocate_pipeline_outputs or config.use_symmetric_memory_p2p)
+                ):
                     send_next_wait_handle.wait()
                     send_next_wait_handle = None
                 # assert fwd_wait_handles is not None
@@ -2037,6 +2304,20 @@ def forward_backward_pipelining_with_interleaving(
                     )
                     if "recv_next" in bwd_wait_handles:
                         recv_next_wait_handles.append(bwd_wait_handles.pop("recv_next"))
+
+                if (
+                    config.use_symmetric_memory_p2p
+                    and send_prev_wait_handle is not None
+                    and (
+                        not overlap_symmetric_p2p_copy
+                        or not getattr(send_prev_wait_handle, 'can_defer_source_wait', False)
+                    )
+                ):
+                    # A graph's next forward can also overwrite a static backward
+                    # output. Do not relax that barrier just because send requests
+                    # now have independent completion events.
+                    send_prev_wait_handle.wait()
+                    send_prev_wait_handle = None
 
                 # Put input_tensor and output_tensor_grad in data structures in the
                 # right location.
@@ -2109,6 +2390,10 @@ def forward_backward_pipelining_with_interleaving(
             if recv_next:
                 output_tensor_grads[next_backward_model_chunk_id].append(output_tensor_grad)
 
+    if overlap_symmetric_p2p_copy and send_next_wait_handle is not None:
+        # Last steady-state output has no following pp_pre_forward to retire it.
+        send_next_wait_handle.wait()
+        send_next_wait_handle = None
     deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
     nvtx_range_pop(suffix="steady")
 
@@ -2278,6 +2563,18 @@ def forward_backward_pipelining_with_interleaving(
     return forward_data_store
 
 
+def _get_p2p_seq_length(seq_length: int, config, tp_group, cp_group) -> int:
+    """Use the same per-rank sequence length for interleaved and non-interleaved PP."""
+    if config.variable_seq_lengths and config.pipeline_p2p_fixed_shape:
+        # Packed capacity is already local to a DP x CP rank; do not divide by CP again.
+        seq_length = config.max_seqlen_per_dp_cp_rank
+    else:
+        seq_length = seq_length // cp_group.size()
+    if config.sequence_parallel:
+        seq_length = seq_length // tp_group.size()
+    return seq_length
+
+
 def get_tensor_shapes(
     *,
     seq_length: int,
@@ -2313,15 +2610,12 @@ def get_tensor_shapes(
         tensor_shapes.append(())
         return tensor_shapes
 
-    # Fixed sequence lengths - compute shape
-    if use_fixed_packed_shape:
-        effective_seq_length = config.max_seqlen_per_dp_cp_rank
-    else:
-        effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
-        effective_seq_length = effective_seq_length // cp_group.size()
-
-    if config.sequence_parallel:
-        effective_seq_length = effective_seq_length // tp_group.size()
+    effective_seq_length = _get_p2p_seq_length(
+        decoder_seq_length if decoder_seq_length is not None else seq_length,
+        config,
+        tp_group,
+        cp_group,
+    )
 
     # Determine hidden dimension based on hyper connections and pipeline stage
     hidden_size = config.hidden_size
@@ -2542,7 +2836,10 @@ def forward_backward_pipelining_without_interleaving(
             p2p_communicator=p2p_communicator,
         )
         p2p_communicator.create_symm_put_wait_buffers(
-            send_tensor_shapes[0], num_warmup_microbatches_pp0, num_microbatches
+            send_tensor_shapes[0],
+            num_warmup_microbatches_pp0,
+            num_microbatches,
+            forward_only=forward_only,
         )
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
@@ -2657,6 +2954,8 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
 
+            if config.use_symmetric_memory_p2p:
+                p2p_communicator.prepare_input_tensor_grad(input_tensor)
             input_tensor_grad = backward_func(
                 input_tensor, output_tensor, output_tensor_grad, config
             )
@@ -2691,6 +2990,8 @@ def forward_backward_pipelining_without_interleaving(
                 send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
+            if config.use_symmetric_memory_p2p:
+                p2p_communicator.prepare_input_tensor_grad(input_tensor)
             input_tensor_grad = backward_func(
                 input_tensor, output_tensor, output_tensor_grad, config
             )

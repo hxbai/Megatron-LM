@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, T
 
 import numpy
 import torch
+from torch.utils._pytree import tree_leaves
 
 from megatron.core import config
 from megatron.core._rank_utils import log_single_rank
@@ -718,6 +719,48 @@ class GlobalMemoryBuffer:
                 )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+
+def mark_tensor_storage_reusable(tensors: Any) -> None:
+    """Mark buffers whose producer may overwrite them while tensor aliases are alive.
+
+    Unlike allocator-owned outputs, CUDA graph outputs and communication buffers
+    cannot be kept safe from reuse by retaining a reference or calling record_stream.
+    Store this property on storage so detach, views and viewless .data wrappers keep
+    it, while a clone or an allocating eager operation gets independent storage.
+    This adds no tensor references or allocations to the buffer's lifetime.
+    """
+    for tensor in tree_leaves(tensors):
+        if isinstance(tensor, torch.Tensor):
+            tensor.untyped_storage()._megatron_reusable = True
+
+
+def is_tensor_storage_reusable(tensor: torch.Tensor) -> bool:
+    """Whether the producer may overwrite this tensor without releasing its storage."""
+    return getattr(tensor.untyped_storage(), '_megatron_reusable', False)
+
+
+def mark_cuda_graph_outputs(outputs: Any) -> None:
+    """Identify TE graph output/gradient storage before it reaches async consumers.
+
+    TE returns aliases of its static forward outputs and backward input gradients.
+    A node post-hook observes those gradients before autograd passes them upstream
+    or adopts them as .grad. Any eager copy/accumulation then naturally creates an
+    unmarked allocation. Register once per node, not once per output, and do not
+    retain tensors or nodes in the hook.
+    """
+    mark_tensor_storage_reusable(outputs)
+
+    def mark_grad_inputs(grad_inputs, _grad_outputs):
+        mark_tensor_storage_reusable(grad_inputs)
+
+    nodes = {
+        tensor.grad_fn
+        for tensor in tree_leaves(outputs)
+        if isinstance(tensor, torch.Tensor) and tensor.grad_fn is not None
+    }
+    for node in nodes:
+        node.register_hook(mark_grad_inputs)
 
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
