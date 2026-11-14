@@ -20,6 +20,7 @@ Determinism:
   not been certified. The accelerated backends use timing-based autotuning.
 """
 
+import functools
 import logging
 import math
 import os
@@ -1670,8 +1671,13 @@ if _CUTILE_AVAILABLE:
             if tile_m <= M and M % tile_m == 0:
                 yield tile_m
 
+    @functools.lru_cache(maxsize=None)
     def _default_reduce_compute_h_tile_m(M: int) -> int:
-        """Pick a reduce tile size with enough blocks to cover the GPU."""
+        """Pick a reduce tile size with enough blocks to cover the GPU.
+
+        Cached per M: the device query (an NVML availability check) cost microseconds of host
+        time on every mHC mapping call.
+        """
         try:
             num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
         except Exception:

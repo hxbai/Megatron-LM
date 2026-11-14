@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import warnings
+import weakref
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Optional, Tuple
@@ -16,7 +17,11 @@ from torch import Tensor
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.component_nvtx import component
 from megatron.core.env_flags import FALSE_VALUES, TRUE_VALUES
-from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutput,
+    CheckpointWithoutOutputManager,
+    _get_share_storage,
+)
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute_plan import (
     build_recompute_block_end_plan,
@@ -39,6 +44,9 @@ class SinglePassMHCState:
     """
 
     pre_mix: Tensor | None = None
+    # MCORE_MHC_SP_FAST: the next sublayer's aggregate, computed by the last BDA
+    # (fused_mhc_single_pass.NextAggregate); used only when its output is the next input.
+    next_aggregate: object | None = None
 
     @component("mhc")
     def contract(
@@ -388,6 +396,45 @@ def _single_pass_coefficient_activations(
     return pre + eps, 2 * post, residual
 
 
+class _SinglePassAggregateReplay(CheckpointWithoutOutput):
+    """MCORE_MHC_SP_FAST: drop the fused forward's aggregate and refill it at block replay.
+
+    It stands in for the default path's checkpointed aggregate in the mHC recompute manager:
+    the manager releases the output storage at the block end and calls ``_recompute`` in forward
+    order from the block's replay hook. The fused mapping Function owns the aggregate's
+    gradients, so the replay only restores the values the branch saved, with the same kernel
+    chain (bit-identical) and without an autograd node.
+    """
+
+    def __init__(self, manager, aggregated, hidden_states, pre_mix, n):
+        super().__init__(ckpt_manager=manager)
+        self.outputs = (aggregated,)
+        # The base class treats ctx None as "already recomputed".
+        self.ctx = True
+        self._replay = (hidden_states, pre_mix, n)
+        manager.add_checkpoint(self)
+
+    def _recompute(self, _):
+        if self._replay is None:
+            return
+        from megatron.core.fusions.fused_mhc_single_pass import sp_aggregate
+
+        hidden_states, pre_mix, n = self._replay
+        self._replay = None
+        s, b, width = hidden_states.shape
+        pre2d = None
+        if pre_mix is not None:
+            pre2d = pre_mix.detach().reshape(s * b, n)
+            if pre2d.dtype != torch.float32 or not pre2d.is_contiguous():
+                pre2d = pre2d.float().contiguous()
+        with torch.no_grad():
+            fresh = sp_aggregate(hidden_states.detach().view(s * b, width), pre2d, n)
+        output = self.outputs[0]
+        _get_share_storage()(output, fresh)
+        self.outputs = None
+        self.ctx = None
+
+
 # ============================================================================
 # HyperConnectionModule
 # ============================================================================
@@ -503,6 +550,17 @@ class HyperConnectionModule(MegatronModule):
             if self.single_pass and _SINGLE_PASS_FUSED_GRAD_ADD is not None
             else None
         )
+
+        # MCORE_MHC_SP_FAST (opt-in): fused single-pass Triton path; see fused_mhc_single_pass.
+        # _sp_fast_pending carries (stash, residual) from forward() to the same sublayer's BDA.
+        self._sp_fast = False
+        self._sp_fast_pending = None
+        if self.single_pass and config.use_fused_mhc:
+            from megatron.core.fusions import fused_mhc_single_pass
+
+            if fused_mhc_single_pass.SINGLE_PASS_FAST:
+                self._sp_fast = True
+                fused_mhc_single_pass.log_single_pass_fast_once()
 
         self._init_weights()
 
@@ -874,6 +932,13 @@ class HyperConnectionModule(MegatronModule):
         if self.single_pass:
             if mhc_state is None:
                 raise ValueError("Single-pass mHC requires a forward-local SinglePassMHCState")
+            if self._sp_fast and return_residual:
+                from megatron.core.fusions.fused_mhc_single_pass import single_pass_fast_supports
+
+                if single_pass_fast_supports(hidden_states, self.n, self.mapping_proj.weight):
+                    return self._single_pass_fast_forward(
+                        hidden_states, mhc_recompute_manager, mhc_state
+                    )
             hs_for_mappings = hs_for_aggregate = hs_for_residual = hidden_states
             if (
                 self._single_pass_grad_add_3_op is not None
@@ -910,6 +975,71 @@ class HyperConnectionModule(MegatronModule):
         else:
             result = self._forward_normal(hidden_states)
         return result if return_residual else result[:3]
+
+    def _single_pass_fast_forward(
+        self,
+        hidden_states: Tensor,
+        manager: Optional[CheckpointWithoutOutputManager],
+        mhc_state: SinglePassMHCState,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """MCORE_MHC_SP_FAST: aggregate and mappings in one fused Function.
+
+        The residual input is not split: the BDA hands its residual gradient to this sublayer's
+        mapping backward through a stash, and that backward returns the input's whole gradient,
+        summed in the default exact order (BDA, aggregate, mappings). With selective mHC
+        recompute, the aggregate is dropped and replayed like the default checkpointed one.
+        """
+        from megatron.core.fusions.fused_mhc_single_pass import (
+            ResidualGradStash,
+            SinglePassPreFunction,
+        )
+
+        ensure_params_ready(
+            (self.mapping_proj.weight, self.alpha_pre, self.alpha_post, self.alpha_res, self.bias)
+        )
+        tracked = torch.is_grad_enabled() and hidden_states.requires_grad
+        stash = ResidualGradStash() if tracked else None
+        pre_mix = mhc_state.pre_mix
+        # The previous BDA computed this input's aggregate (under pre_mix) as it wrote the input.
+        holder, mhc_state.next_aggregate = mhc_state.next_aggregate, None
+        precomputed = holder.take(hidden_states) if holder is not None else None
+        aggregated, h_pre, h_post, h_res = SinglePassPreFunction.apply(
+            hidden_states,
+            pre_mix,
+            self.mapping_proj.weight,
+            self.alpha_pre,
+            self.alpha_post,
+            self.alpha_res,
+            self.bias,
+            self.n,
+            self.norm_eps,
+            self.compute_h_eps,
+            self.sinkhorn_eps,
+            self.sinkhorn_iterations,
+            stash,
+            precomputed,
+        )
+        if manager is not None:
+            from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+            if not is_graph_warmup():
+                _SinglePassAggregateReplay(manager, aggregated, hidden_states, pre_mix, self.n)
+        mhc_state.pre_mix = h_pre
+        self._sp_fast_pending = (stash, hidden_states, mhc_state)
+        return aggregated, h_res, h_post, hidden_states
+
+    def _single_pass_bda_fast(
+        self, h_res, original_residual, h_post, x, stash, next_agg=None
+    ) -> Tensor:
+        """MCORE_MHC_SP_FAST BDA: residual gradient to the stash when one is given, and the next
+        sublayer's aggregate into ``next_agg`` (first call only, not on checkpoint replay)."""
+        from megatron.core.fusions.fused_mhc_single_pass import SinglePassBDAFunction
+
+        if stash is not None:
+            stash.active = True
+        return SinglePassBDAFunction.apply(
+            h_res, original_residual, h_post, x, self.n, stash, next_agg
+        )
 
     def _single_pass_aggregate(self, hidden_states: Tensor, pre_mix: Tensor | None) -> Tensor:
         """Aggregate with an explicit predecessor, safe for checkpoint replay."""
@@ -1069,6 +1199,45 @@ class HyperConnectionModule(MegatronModule):
             output: [s, b, n*C] - final output after all operations
         """
         if self.single_pass:
+            pending, self._sp_fast_pending = self._sp_fast_pending, None
+            if (
+                pending is not None
+                and pending[1] is original_residual
+                and layer_output_with_bias[1] is None
+                and (not training or dropout_prob == 0.0)
+            ):
+                from megatron.core.fusions import fused_mhc_single_pass
+
+                mhc_state = pending[2]
+                h_pre = mhc_state.pre_mix
+                next_agg = (
+                    fused_mhc_single_pass.NextAggregate(h_pre.reshape(-1, self.n))
+                    if fused_mhc_single_pass.SINGLE_PASS_FAST_NEXT_AGG
+                    and h_pre is not None
+                    and h_pre.dtype == torch.float32
+                    and h_pre.is_contiguous()
+                    else None
+                )
+                fast_args = (
+                    h_res,
+                    original_residual,
+                    h_post,
+                    layer_output_with_bias[0],
+                    pending[0],
+                    next_agg,
+                )
+                if manager is None:
+                    output = self._single_pass_bda_fast(*fast_args)
+                else:
+                    from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+
+                    output = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+                        self._single_pass_bda_fast, *fast_args
+                    )
+                if next_agg is not None and next_agg.filled:
+                    next_agg.out = weakref.ref(output)
+                    mhc_state.next_aggregate = next_agg
+                return output
             args = (
                 h_res,
                 original_residual,
